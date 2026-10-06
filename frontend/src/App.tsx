@@ -21,7 +21,7 @@ export default function App() {
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const currentDam = damStore.currentDam()
-  const openAlarms = alarmStore.alarms.filter((alarm) => alarm.state !== '已闭环').length
+  const openAlarms = alarmStore.alarms.filter((alarm) => alarm.state !== '已闭环' && alarm.state !== '已撤销').length
 
   const navItems = [
     { path: ROUTES.dams, label: '坝体台账', count: damStore.dams.length },

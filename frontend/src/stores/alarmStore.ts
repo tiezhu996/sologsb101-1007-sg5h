@@ -72,6 +72,8 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
     const next: Partial<AlarmRow> = { ...patch, updatedAt: Date.now() }
     if (patch.handler !== undefined) next.handler = patch.handler.trim()
     if (patch.measure !== undefined) next.measure = patch.measure.trim()
+    // 人工重新编辑/重判即视为已确认订正后的级别与触发值，撤销「读数已订正」待重判标记
+    next.readingCorrected = false
     await db.alarms.update(id, next)
   },
 
@@ -93,12 +95,13 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
       state: '已闭环',
       handler: handler.trim() || '未署名',
       measure: measure.trim() || '处置完成，复测无异常',
+      readingCorrected: false,
       updatedAt: Date.now()
     })
   },
 
   counts() {
-    const counts: Record<AlarmState, number> = { 待处置: 0, 处置中: 0, 已闭环: 0 }
+    const counts: Record<AlarmState, number> = { 待处置: 0, 处置中: 0, 已闭环: 0, 已撤销: 0 }
     get().alarms.forEach((alarm) => {
       counts[alarm.state] += 1
     })

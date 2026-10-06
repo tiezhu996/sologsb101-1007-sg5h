@@ -22,13 +22,15 @@ import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import ReadingCorrectionModal from '@/components/common/ReadingCorrectionModal'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type ObservationRow } from '@/utils/db'
+import { applyReadingCorrection, db, type CorrectionRow, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
+import type { ReadingCorrectionDraft } from '@/types/correction'
 import { formatRate, formatReading, ratioOf } from '@/utils/threshold'
 
 interface TrendRow {
@@ -49,11 +51,14 @@ export default function TrendBoard() {
   const alarmStore = useAlarmStore()
   const alarmLevel = useAlarmLevel()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
+  const correctionTable = useIdbTable<CorrectionRow>(db.corrections, { sortByUpdatedAt: false })
 
   const [drawerPointId, setDrawerPointId] = useState<string | null>(null)
   const [onlyExceeded, setOnlyExceeded] = useState(false)
   const [thresholdOpen, setThresholdOpen] = useState(false)
   const [editingPoint, setEditingPoint] = useState<Point | null>(null)
+  const [correctionTarget, setCorrectionTarget] = useState<ObservationRow | null>(null)
+  const [correctionSaving, setCorrectionSaving] = useState(false)
   const [thresholdForm] = Form.useForm<{ initialValue: number; threshold: number }>()
 
   const filter = pointStore.filter
@@ -127,8 +132,45 @@ export default function TrendBoard() {
         .sort((a, b) => b.date.localeCompare(a.date)),
     [observationTable.rows, drawerPointId]
   )
+  const drawerCorrections = useMemo(
+    () =>
+      correctionTable.rows
+        .filter((row) => row.pointId === drawerPointId)
+        .sort((a, b) => b.createdAt - a.createdAt),
+    [correctionTable.rows, drawerPointId]
+  )
+  const correctedObsIds = useMemo(() => new Set(drawerCorrections.map((row) => row.observationId)), [drawerCorrections])
   const drawerLatest = drawerObservations[0] ?? null
   const drawerLevel = drawerPoint && drawerLatest ? alarmLevel.evaluate(drawerPoint, drawerLatest.reading).level : null
+
+  const submitCorrection = async (draft: ReadingCorrectionDraft): Promise<void> => {
+    if (!correctionTarget || !drawerPoint) return
+    if (draft.readingAfter === correctionTarget.reading) {
+      message.warning('订正后读数与当前读数一致，无需订正')
+      return
+    }
+    setCorrectionSaving(true)
+    try {
+      const result = await applyReadingCorrection({
+        pointId: drawerPoint.id,
+        observationId: correctionTarget.id,
+        readingAfter: draft.readingAfter,
+        corrector: draft.corrector,
+        reason: draft.reason
+      })
+      const revoked = result.alarms.filter((item) => item.state === '已撤销').length
+      const rejudged = result.alarms.length - revoked
+      message.success(
+        `订正已提交，自 ${result.observation.date} 起重算累计变化与日速率` +
+          (result.alarms.length > 0 ? `；${revoked} 张已撤销、${rejudged} 张已按新值更新` : '')
+      )
+      setCorrectionTarget(null)
+    } catch (error) {
+      message.error(`订正失败：${error instanceof Error ? error.message : '未知错误'}`)
+    } finally {
+      setCorrectionSaving(false)
+    }
+  }
 
   const generateAlarm = async (point: Point, observation: ObservationRow): Promise<void> => {
     if (alarmStore.alarms.some((alarm) => alarm.pointId === point.id && alarm.triggerDate === observation.date)) {
@@ -346,11 +388,62 @@ export default function TrendBoard() {
                 pagination={false}
                 dataSource={drawerObservations}
                 columns={[
-                  { title: '日期', dataIndex: 'date', width: 120 },
-                  { title: '读数', dataIndex: 'reading', width: 110, render: (value: number) => value.toFixed(3) },
-                  { title: '累计变化', dataIndex: 'cumulative', width: 120, render: (value: number) => value.toFixed(3) },
-                  { title: '日速率', dataIndex: 'dailyRate', width: 110, render: (value: number) => value.toFixed(4) },
-                  { title: '观测人', dataIndex: 'observer', width: 100 }
+                  { title: '日期', dataIndex: 'date', width: 110 },
+                  {
+                    title: '读数',
+                    dataIndex: 'reading',
+                    width: 130,
+                    render: (value: number, record) => (
+                      <Space size={4}>
+                        <span>{value.toFixed(3)}</span>
+                        {correctedObsIds.has(record.id) ? <Tag color="purple">已订正</Tag> : null}
+                      </Space>
+                    )
+                  },
+                  { title: '累计变化', dataIndex: 'cumulative', width: 110, render: (value: number) => value.toFixed(3) },
+                  { title: '日速率', dataIndex: 'dailyRate', width: 100, render: (value: number) => value.toFixed(4) },
+                  { title: '观测人', dataIndex: 'observer', width: 90 },
+                  {
+                    title: '操作',
+                    width: 80,
+                    render: (_value, record) => (
+                      <Button type="link" size="small" style={{ color: '#7c3aed', padding: 0 }} onClick={() => setCorrectionTarget(record)}>
+                        订正
+                      </Button>
+                    )
+                  }
+                ]}
+              />
+            )}
+
+            <div style={{ margin: '14px 0 6px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <strong>订正记录（{drawerCorrections.length}）</strong>
+              <span className="muted">同日以最后一次订正为准，后续累计与速率已重算</span>
+            </div>
+            {drawerCorrections.length === 0 ? (
+              <p className="muted">暂无订正记录。</p>
+            ) : (
+              <Table<CorrectionRow>
+                rowKey="id"
+                size="small"
+                bordered
+                pagination={false}
+                dataSource={drawerCorrections}
+                columns={[
+                  { title: '日期', dataIndex: 'date', width: 100 },
+                  {
+                    title: '前值 → 后值',
+                    width: 160,
+                    render: (_value, record) => (
+                      <span>
+                        <span style={{ color: '#b03a2e' }}>{record.readingBefore.toFixed(3)}</span>
+                        {' → '}
+                        <span style={{ color: '#2f7a4f', fontWeight: 600 }}>{record.readingAfter.toFixed(3)}</span>
+                      </span>
+                    )
+                  },
+                  { title: '订正人', dataIndex: 'corrector', width: 80 },
+                  { title: '原因', dataIndex: 'reason' }
                 ]}
               />
             )}
@@ -359,6 +452,15 @@ export default function TrendBoard() {
           <EmptyPanel title="未选择测点" description="从速率排行中选择一个测点查看详情。" compact />
         )}
       </Drawer>
+
+      <ReadingCorrectionModal
+        open={correctionTarget !== null}
+        point={drawerPoint}
+        observation={correctionTarget}
+        confirmLoading={correctionSaving}
+        onCancel={() => setCorrectionTarget(null)}
+        onSubmit={submitCorrection}
+      />
 
       <Modal
         open={thresholdOpen}

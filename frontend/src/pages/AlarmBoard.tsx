@@ -1,10 +1,11 @@
 /**
  * /alarms 预警触发与处置闭环
  * 按级别与状态处置预警，填写措施与处置人，状态机 待处置 → 处置中 → 已闭环。
+ * 读数订正联动：待处置且订正后不再越限自动「已撤销」；处置中的保留状态并标记「读数已订正」等人工重判；已闭环保留当时内容。
  * 消费 Alarm、Point、Observation；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -70,7 +71,7 @@ export default function AlarmBoard() {
     if (damId && alarm.damId !== damId) return false
     if (levels.length > 0 && !levels.includes(alarm.level)) return false
     if (alarmStore.stateFilter.length > 0 && !alarmStore.stateFilter.includes(alarm.state)) return false
-    if (alarmStore.onlyOpen && alarm.state === '已闭环') return false
+    if (alarmStore.onlyOpen && (alarm.state === '已闭环' || alarm.state === '已撤销')) return false
     const text = keyword.trim().toLowerCase()
     if (text.length === 0) return true
     const point = pointStore.points.find((item) => item.id === alarm.pointId)
@@ -166,7 +167,11 @@ export default function AlarmBoard() {
         return `${dam ? dam.name : '—'} / ${point ? point.code : '测点已删除'}`
       }
     },
-    { title: '级别', width: 150, render: (_value, record) => <AlarmTag level={record.level} size="small" /> },
+    {
+      title: '级别',
+      width: 150,
+      render: (_value, record) => <AlarmTag level={record.level} size="small" />
+    },
     {
       title: '触发值',
       width: 130,
@@ -188,22 +193,56 @@ export default function AlarmBoard() {
     },
     {
       title: '状态',
-      width: 110,
-      render: (_value, record) => (
-        <Tag color={record.state === '已闭环' ? 'green' : record.state === '处置中' ? 'blue' : 'orange'}>
-          {record.state}
-        </Tag>
-      )
+      width: 130,
+      render: (_value, record) => {
+        if (record.state === '已闭环') {
+          return <Tag color="green">已闭环</Tag>
+        }
+        if (record.state === '已撤销') {
+          return (
+            <Tooltip title={record.canceledReason || '订正后不再越限，已自动撤销'}>
+              <Tag color="default">已撤销</Tag>
+            </Tooltip>
+          )
+        }
+        return (
+          <Space size={4}>
+            <Tag color={record.state === '处置中' ? 'blue' : 'orange'}>{record.state}</Tag>
+            {record.readingCorrected ? (
+              <Tooltip title="触发该预警的读数已被订正，级别与触发值已按新值更新，请人工复核后继续处置或闭环">
+                <Tag color="purple" style={{ marginInlineEnd: 0 }}>
+                  读数已订正
+                </Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        )
+      }
     },
     { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
-    { title: '处置措施', dataIndex: 'measure', width: 220, render: (value: string) => value || '—' },
+    {
+      title: '处置措施 / 撤销说明',
+      width: 240,
+      render: (_value, record) =>
+        record.state === '已撤销' ? (
+          <span className="muted">{record.canceledReason || '订正后不再越限，已自动撤销'}</span>
+        ) : (
+          record.measure || '—'
+        )
+    },
     {
       title: '操作',
       width: 220,
       render: (_value, record) => (
         <Space size={4}>
           <Button type="link" size="small" disabled={!ALARM_STATE_FLOW[record.state]} onClick={() => advance(record)}>
-            {ALARM_STATE_FLOW[record.state] === '处置中' ? '开始处置' : ALARM_STATE_FLOW[record.state] === '已闭环' ? '闭环' : '已闭环'}
+            {ALARM_STATE_FLOW[record.state] === '处置中'
+              ? '开始处置'
+              : ALARM_STATE_FLOW[record.state] === '已闭环'
+                ? '闭环'
+                : record.state === '已撤销'
+                  ? '已撤销'
+                  : '已闭环'}
           </Button>
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
@@ -224,7 +263,7 @@ export default function AlarmBoard() {
         <div>
           <h2 className="page-head__title">预警触发与处置闭环</h2>
           <p className="page-head__desc">
-            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档。
+            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档；读数订正后不再越限的待处置预警自动撤销，处置中预警标记「读数已订正」等人工重判。
           </p>
         </div>
         <div className="page-head__actions">
@@ -245,7 +284,7 @@ export default function AlarmBoard() {
         <StatBadge label="预警总数" value={alarmStore.alarms.length} suffix="张" tone="primary" />
         <StatBadge label="待处置" value={counts['待处置']} suffix="张" tone="warning" />
         <StatBadge label="处置中" value={counts['处置中']} suffix="张" tone="info" />
-        <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="danger" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`} />
+        <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="danger" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']} · 已撤销 ${counts['已撤销']}`} />
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索测点编号 / 处置人 / 措施" onModelChange={onModelChange} />
@@ -255,7 +294,7 @@ export default function AlarmBoard() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             预警清单（{rows.length} / {alarmStore.alarms.length}）
           </h3>
-          <span className="muted">蓝色为接近阈值，红色为严重越限</span>
+          <span className="muted">蓝色为接近阈值，红色为严重越限；已撤销为订正后不再越限的待处置预警</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
