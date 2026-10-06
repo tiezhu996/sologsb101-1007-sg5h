@@ -4,18 +4,21 @@
  * 消费 Observation、Point；复用 <FilterBar>、<AlarmTag>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
+import CorrectionModal from '@/components/common/CorrectionModal'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useCorrectionStore } from '@/stores/correctionStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, putObservation, type ObservationRow } from '@/utils/db'
+import { latestCorrectionByObservation } from '@/utils/correction'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
 import type { ObservationDraft } from '@/types/observation'
 
@@ -25,11 +28,13 @@ export default function ObservationEntry() {
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
   const alarmLevel = useAlarmLevel()
+  const correctionStore = useCorrectionStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
 
   const [form] = Form.useForm<ObservationDraft>()
   const [open, setOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [correctTarget, setCorrectTarget] = useState<ObservationRow | null>(null)
 
   const filter = pointStore.filter
   const filterSelects = useMemo(
@@ -71,6 +76,21 @@ export default function ObservationEntry() {
       observationTable.rows
         .filter((row) => row.pointId === activePointId)
         .sort((a, b) => b.date.localeCompare(a.date)),
+    [observationTable.rows, activePointId]
+  )
+
+  /** 同一测点同一天以最后一次订正为准：observationId → 最新订正留痕 */
+  const latestCorrectionMap = useMemo(
+    () => latestCorrectionByObservation(correctionStore.corrections),
+    [correctionStore.corrections]
+  )
+
+  /** 当前测点按日期升序的序列（订正弹窗预览日速率用） */
+  const activeSeriesAsc = useMemo(
+    () =>
+      observationTable.rows
+        .filter((row) => row.pointId === activePointId)
+        .sort((a, b) => a.date.localeCompare(b.date)),
     [observationTable.rows, activePointId]
   )
 
@@ -118,6 +138,7 @@ export default function ObservationEntry() {
       return
     }
     const now = Date.now()
+    const existing = editingId ? observationTable.rows.find((row) => row.id === editingId) ?? null : null
     try {
       await putObservation({
         id: editingId ?? `ob_${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
@@ -125,14 +146,18 @@ export default function ObservationEntry() {
         date: values.date,
         reading: Number(values.reading) || 0,
         observer: values.observer.trim() || '未署名',
-        createdAt: now,
+        createdAt: existing ? existing.createdAt : now,
         updatedAt: now
       })
     } catch (error) {
       message.error(`观测保存失败：${error instanceof Error ? error.message : '未知错误'}`)
       return
     }
-    message.success(editingId ? '观测记录已更新，累计量与日速率已重算' : '观测已录入，累计量与日速率已自动计算')
+    message.success(
+      editingId
+        ? '观测记录已更新（读数如需修改请使用「订正」留痕），累计量与日速率已重算'
+        : '观测已录入，累计量与日速率已自动计算'
+    )
     setOpen(false)
   }
 
@@ -161,8 +186,41 @@ export default function ObservationEntry() {
   }
 
   const columns: TableColumnsType<ObservationRow> = [
-    { title: '日期', dataIndex: 'date', width: 120 },
-    { title: '读数', dataIndex: 'reading', width: 120, render: (value: number) => value.toFixed(3) },
+    {
+      title: '日期',
+      dataIndex: 'date',
+      width: 120,
+      render: (value: string, record) => (
+        <Space size={4}>
+          <span>{value}</span>
+          {latestCorrectionMap.has(record.id) ? (
+            <Tooltip title={`读数已订正：${latestCorrectionMap.get(record.id)?.corrector} · ${latestCorrectionMap.get(record.id)?.reason}`}>
+              <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                已订正
+              </Tag>
+            </Tooltip>
+          ) : null}
+        </Space>
+      )
+    },
+    {
+      title: '读数',
+      dataIndex: 'reading',
+      width: 150,
+      render: (value: number, record) => {
+        const correction = latestCorrectionMap.get(record.id)
+        return (
+          <Space direction="vertical" size={0}>
+            <span>{value.toFixed(3)}</span>
+            {correction ? (
+              <span className="muted" style={{ fontSize: 12 }}>
+                原值 {correction.readingBefore.toFixed(3)}
+              </span>
+            ) : null}
+          </Space>
+        )
+      }
+    },
     {
       title: '累计变化',
       dataIndex: 'cumulative',
@@ -183,11 +241,14 @@ export default function ObservationEntry() {
     { title: '观测人', dataIndex: 'observer', width: 100 },
     {
       title: '操作',
-      width: 130,
+      width: 200,
       render: (_value, record) => (
         <Space size={4}>
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
+          </Button>
+          <Button type="link" size="small" danger onClick={() => setCorrectTarget(record)}>
+            订正
           </Button>
           <Popconfirm title="确认删除该观测记录？" onConfirm={() => remove(record)}>
             <Button type="link" size="small" danger>
@@ -219,6 +280,7 @@ export default function ObservationEntry() {
       <div className="stat-row">
         <StatBadge label="观测记录" value={observationTable.rows.length} suffix="条" tone="primary" />
         <StatBadge label="已观测测点" value={new Set(observationTable.rows.map((row) => row.pointId)).size} suffix="个" tone="info" />
+        <StatBadge label="订正记录" value={correctionStore.corrections.length} suffix="条" tone="default" />
         <StatBadge label="预警单总数" value={alarmStore.alarms.length} suffix="张" tone="warning" />
         <StatBadge label="待处置预警" value={alarmStore.counts()['待处置']} suffix="张" tone="danger" />
       </div>
@@ -308,7 +370,7 @@ export default function ObservationEntry() {
 
       <Modal
         open={open}
-        title={editingId ? '编辑观测记录' : `录入观测${activePoint ? ` · ${activePoint.code}` : ''}`}
+        title={editingId ? '编辑观测记录（读数订正请用「订正」）' : `录入观测${activePoint ? ` · ${activePoint.code}` : ''}`}
         onCancel={() => setOpen(false)}
         onOk={submit}
         okText="保存"
@@ -333,10 +395,15 @@ export default function ObservationEntry() {
             <Input />
           </Form.Item>
           <Form.Item name="date" label="观测日期" rules={[{ required: true, message: '请填写观测日期' }]}>
-            <Input placeholder="YYYY-MM-DD" />
+            <Input placeholder="YYYY-MM-DD" disabled={editingId !== null} />
           </Form.Item>
-          <Form.Item name="reading" label="读数" rules={[{ required: true, message: '请填写读数' }]}>
-            <InputNumber step={0.1} style={{ width: '100%' }} />
+          <Form.Item
+            name="reading"
+            label="读数"
+            rules={[{ required: true, message: '请填写读数' }]}
+            extra={editingId ? '读数录错请关闭本窗后点该行「订正」，订正会留痕并重算累计量、日速率与预警。' : undefined}
+          >
+            <InputNumber step={0.1} style={{ width: '100%' }} disabled={editingId !== null} />
           </Form.Item>
           <Form.Item name="observer" label="观测人" rules={[{ required: true, message: '请填写观测人' }]}>
             <Input placeholder="如 刘振国" />
@@ -351,6 +418,14 @@ export default function ObservationEntry() {
           ) : null}
         </Form>
       </Modal>
+
+      <CorrectionModal
+        open={correctTarget !== null}
+        point={activePoint}
+        observation={correctTarget}
+        series={activeSeriesAsc}
+        onClose={() => setCorrectTarget(null)}
+      />
     </div>
   )
 }

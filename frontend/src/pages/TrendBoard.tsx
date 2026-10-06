@@ -15,7 +15,8 @@ import {
   Popconfirm,
   Space,
   Table,
-  Tag
+  Tag,
+  Tooltip
 } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
@@ -25,9 +26,11 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { useCorrectionStore } from '@/stores/correctionStore'
 import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
+import { latestCorrectionByObservation } from '@/utils/correction'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
 import { formatRate, formatReading, ratioOf } from '@/utils/threshold'
 
@@ -48,7 +51,14 @@ export default function TrendBoard() {
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
   const alarmLevel = useAlarmLevel()
+  const correctionStore = useCorrectionStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
+
+  /** 速率排行读新结果：订正后 observation 已更新，此处映射出的现行订正用于标记历史行 */
+  const latestCorrectionMap = useMemo(
+    () => latestCorrectionByObservation(correctionStore.corrections),
+    [correctionStore.corrections]
+  )
 
   const [drawerPointId, setDrawerPointId] = useState<string | null>(null)
   const [onlyExceeded, setOnlyExceeded] = useState(false)
@@ -346,8 +356,42 @@ export default function TrendBoard() {
                 pagination={false}
                 dataSource={drawerObservations}
                 columns={[
-                  { title: '日期', dataIndex: 'date', width: 120 },
-                  { title: '读数', dataIndex: 'reading', width: 110, render: (value: number) => value.toFixed(3) },
+                  {
+                    title: '日期',
+                    dataIndex: 'date',
+                    width: 150,
+                    render: (value: string, record) =>
+                      latestCorrectionMap.has(record.id) ? (
+                        <Space size={4}>
+                          <span>{value}</span>
+                          <Tooltip title={`读数已订正：${latestCorrectionMap.get(record.id)?.corrector} · ${latestCorrectionMap.get(record.id)?.reason}`}>
+                            <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                              已订正
+                            </Tag>
+                          </Tooltip>
+                        </Space>
+                      ) : (
+                        value
+                      )
+                  },
+                  {
+                    title: '读数',
+                    dataIndex: 'reading',
+                    width: 140,
+                    render: (value: number, record) => {
+                      const correction = latestCorrectionMap.get(record.id)
+                      return correction ? (
+                        <Space direction="vertical" size={0}>
+                          <span>{value.toFixed(3)}</span>
+                          <span className="muted" style={{ fontSize: 12 }}>
+                            原值 {correction.readingBefore.toFixed(3)}
+                          </span>
+                        </Space>
+                      ) : (
+                        value.toFixed(3)
+                      )
+                    }
+                  },
                   { title: '累计变化', dataIndex: 'cumulative', width: 120, render: (value: number) => value.toFixed(3) },
                   { title: '日速率', dataIndex: 'dailyRate', width: 110, render: (value: number) => value.toFixed(4) },
                   { title: '观测人', dataIndex: 'observer', width: 100 }

@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
+import { isTerminalAlarm } from '@/types/alarm'
 import { DAM_GRADES, DAM_TYPES, EMPTY_DAM_DRAFT, formatHeight, type Dam, type DamDraft, type DamGrade, type DamType } from '@/types/dam'
 import { EMPTY_SECTION_DRAFT, formatSlope, formatStakeNo, type Section, type SectionDraft } from '@/types/section'
 
@@ -59,7 +60,7 @@ export default function DamList() {
 
   const pointCountOf = (damId: string): number => pointStore.points.filter((point) => point.damId === damId).length
   const openAlarmCountOf = (damId: string): number =>
-    alarmStore.alarms.filter((alarm) => alarm.damId === damId && alarm.state !== '已闭环').length
+    alarmStore.alarms.filter((alarm) => alarm.damId === damId && !isTerminalAlarm(alarm.state)).length
 
   const openCreateDam = (): void => {
     setEditingDamId(null)
@@ -198,7 +199,7 @@ export default function DamList() {
         <StatBadge label="测点总数" value={pointStore.points.length} suffix="个" tone="default" />
         <StatBadge
           label="未闭环预警"
-          value={alarmStore.alarms.filter((alarm) => alarm.state !== '已闭环').length}
+          value={alarmStore.alarms.filter((alarm) => !isTerminalAlarm(alarm.state)).length}
           percent={100 - alarmStore.closedPercent()}
           tone="danger"
         />

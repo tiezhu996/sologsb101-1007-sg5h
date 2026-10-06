@@ -7,6 +7,7 @@ import { liveQuery } from 'dexie'
 import { createId, db, type AlarmRow } from '@/utils/db'
 import {
   ALARM_LEVEL_WEIGHT,
+  isTerminalAlarm,
   type Alarm,
   type AlarmDraft,
   type AlarmLevel,
@@ -25,6 +26,8 @@ interface AlarmState_ {
   removeAlarm: (id: string) => Promise<void>
   advance: (id: string) => Promise<AlarmState | null>
   closeAlarm: (id: string, handler: string, measure: string) => Promise<void>
+  /** 读数订正后的人工重判：维持处置流程（清除订正标记）或确认撤销 */
+  rejudgeAlarm: (id: string, outcome: 'keep' | 'revoke') => Promise<void>
   counts: () => Record<AlarmState, number>
   levelCounts: () => Record<AlarmLevel, number>
   closedPercent: () => number
@@ -61,6 +64,8 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
       state: draft.state,
       handler: draft.handler.trim(),
       measure: draft.measure.trim(),
+      readingCorrected: false,
+      lastCorrectionId: '',
       createdAt: now,
       updatedAt: now
     }
@@ -84,6 +89,7 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
     if (!alarm) return null
     const next: AlarmState | null = alarm.state === '待处置' ? '处置中' : alarm.state === '处置中' ? '已闭环' : null
     if (!next) return null
+    // 进入处置中时若带着读数订正标记，保留标记继续等待人工重判
     await db.alarms.update(id, { state: next, updatedAt: Date.now() })
     return next
   },
@@ -93,12 +99,23 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
       state: '已闭环',
       handler: handler.trim() || '未署名',
       measure: measure.trim() || '处置完成，复测无异常',
+      readingCorrected: false,
       updatedAt: Date.now()
     })
   },
 
+  async rejudgeAlarm(id, outcome) {
+    const now = Date.now()
+    if (outcome === 'revoke') {
+      await db.alarms.update(id, { state: '已撤销', readingCorrected: false, updatedAt: now })
+      return
+    }
+    // 人工确认预警仍然成立：清除“读数已订正”标记，回到正常处置流程
+    await db.alarms.update(id, { readingCorrected: false, updatedAt: now })
+  },
+
   counts() {
-    const counts: Record<AlarmState, number> = { 待处置: 0, 处置中: 0, 已闭环: 0 }
+    const counts: Record<AlarmState, number> = { 待处置: 0, 处置中: 0, 已闭环: 0, 已撤销: 0 }
     get().alarms.forEach((alarm) => {
       counts[alarm.state] += 1
     })
@@ -116,26 +133,25 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
   closedPercent() {
     const { alarms } = get()
     if (alarms.length === 0) return 0
-    const closed = alarms.filter((alarm) => alarm.state === '已闭环').length
-    return Math.round((closed / alarms.length) * 100)
+    const finished = alarms.filter((alarm) => isTerminalAlarm(alarm.state)).length
+    return Math.round((finished / alarms.length) * 100)
   },
 
   sortedAlarms() {
-    return [...get().alarms].sort((a, b) => {
-      const levelDiff = ALARM_LEVEL_WEIGHT[b.level] - ALARM_LEVEL_WEIGHT[a.level]
-      if (levelDiff !== 0) return levelDiff
-      return b.triggerDate.localeCompare(a.triggerDate)
-    })
+    return [...get().alarms].sort(compareAlarms)
   }
 }))
 
-liveQuery(async () =>
-  (await db.alarms.toArray()).sort((a, b) => {
-    const levelDiff = ALARM_LEVEL_WEIGHT[b.level] - ALARM_LEVEL_WEIGHT[a.level]
-    if (levelDiff !== 0) return levelDiff
-    return b.triggerDate.localeCompare(a.triggerDate)
-  })
-).subscribe({
+/** 排序：未终结在前（红 > 橙 > 黄 > 蓝），已闭环 / 已撤销沉底；同级别按触发日期倒序 */
+function compareAlarms(a: Alarm, b: Alarm): number {
+  const openDiff = Number(isTerminalAlarm(a.state)) - Number(isTerminalAlarm(b.state))
+  if (openDiff !== 0) return openDiff
+  const levelDiff = ALARM_LEVEL_WEIGHT[b.level] - ALARM_LEVEL_WEIGHT[a.level]
+  if (levelDiff !== 0) return levelDiff
+  return b.triggerDate.localeCompare(a.triggerDate)
+}
+
+liveQuery(async () => (await db.alarms.toArray()).sort(compareAlarms)).subscribe({
   next: (rows) => useAlarmStore.setState({ alarms: rows, ready: true }),
   error: () => useAlarmStore.setState({ ready: true })
 })

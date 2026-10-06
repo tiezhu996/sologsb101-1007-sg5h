@@ -89,7 +89,7 @@ export function severityScore(level: AlarmLevel | null, type: string): number {
 
 /** 把某测点的观测记录整理为趋势取点 */
 export function buildTrendPoints(observations: Observation[]): TrendPoint[] {
-  const sorted = [...observations].sort((a, b) => a.date.localeCompare(b.date))
+  const sorted = [...observations].sort(compareObservationSeries)
   return sorted.map((row, index) => ({
     seq: index + 1,
     date: row.date,
@@ -97,6 +97,35 @@ export function buildTrendPoints(observations: Observation[]): TrendPoint[] {
     cumulative: row.cumulative,
     dailyRate: row.dailyRate
   }))
+}
+
+/**
+ * 观测序列排序：按日期升序；同日（重复录入/订正场景）按创建时间升序，保证首条为序列起点。
+ */
+export function compareObservationSeries(a: Pick<Observation, 'date' | 'createdAt'>, b: Pick<Observation, 'date' | 'createdAt'>): number {
+  const byDate = a.date.localeCompare(b.date)
+  if (byDate !== 0) return byDate
+  return (a.createdAt ?? 0) - (b.createdAt ?? 0)
+}
+
+/**
+ * 以给定初值重算某测点整条观测序列的累计变化量与日速率。
+ * 返回 observationId → { cumulative, dailyRate }，供订正后“从订正当日起重算后续”比对写入。
+ */
+export function recomputeSeries(
+  observations: Observation[],
+  initialValue: number
+): Map<string, { cumulative: number; dailyRate: number }> {
+  const sorted = [...observations].sort(compareObservationSeries)
+  const result = new Map<string, { cumulative: number; dailyRate: number }>()
+  sorted.forEach((row, index) => {
+    const previous = index === 0 ? null : sorted[index - 1]
+    result.set(row.id, {
+      cumulative: cumulativeOf(row.reading, initialValue),
+      dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
+    })
+  })
+  return result
 }
 
 /** 毫米 → 米 */

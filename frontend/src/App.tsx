@@ -7,8 +7,9 @@ import { ROUTES } from './router'
 import { useDamStore } from './stores/damStore'
 import { usePointStore } from './stores/pointStore'
 import { useAlarmStore } from './stores/alarmStore'
+import { isTerminalAlarm } from './types/alarm'
 import { useIdbTable } from './hooks/useIdbTable'
-import { db, type ObservationRow } from './utils/db'
+import { db, type CorrectionRow, type ObservationRow } from './utils/db'
 
 const { Header, Content, Footer } = Layout
 
@@ -19,9 +20,11 @@ export default function App() {
   const pointStore = usePointStore()
   const alarmStore = useAlarmStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations, { sortByUpdatedAt: false })
+  const correctionTable = useIdbTable<CorrectionRow>(db.corrections, { sortByUpdatedAt: false })
 
   const currentDam = damStore.currentDam()
-  const openAlarms = alarmStore.alarms.filter((alarm) => alarm.state !== '已闭环').length
+  const openAlarms = alarmStore.alarms.filter((alarm) => !isTerminalAlarm(alarm.state)).length
+  const correctionCount = correctionTable.rows.length
 
   const navItems = [
     { path: ROUTES.dams, label: '坝体台账', count: damStore.dams.length },
@@ -29,6 +32,7 @@ export default function App() {
     { path: ROUTES.observations, label: '观测录入', count: observationTable.rows.length },
     { path: ROUTES.trends, label: '速率计算', count: pointStore.points.length },
     { path: ROUTES.alarms, label: '预警处置', count: openAlarms },
+    { path: ROUTES.corrections, label: '订正记录', count: correctionCount },
     { path: ROUTES.pool, label: '库水位', count: 0 }
   ]
 

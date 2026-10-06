@@ -4,7 +4,7 @@
  * 消费 Alarm、Point、Observation；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -20,6 +20,8 @@ import {
   ALARM_STATE_FLOW,
   ALARM_STATES,
   EMPTY_ALARM_DRAFT,
+  isOpenAlarm,
+  isTerminalAlarm,
   type Alarm,
   type AlarmDraft,
   type AlarmLevel,
@@ -39,6 +41,7 @@ export default function AlarmBoard() {
   const [closeOpen, setCloseOpen] = useState(false)
   const [closeTarget, setCloseTarget] = useState<Alarm | null>(null)
   const [closeForm] = Form.useForm<{ handler: string; measure: string }>()
+  const [rejudgeTarget, setRejudgeTarget] = useState<Alarm | null>(null)
 
   const filterSelects = useMemo(
     () => [
@@ -70,7 +73,7 @@ export default function AlarmBoard() {
     if (damId && alarm.damId !== damId) return false
     if (levels.length > 0 && !levels.includes(alarm.level)) return false
     if (alarmStore.stateFilter.length > 0 && !alarmStore.stateFilter.includes(alarm.state)) return false
-    if (alarmStore.onlyOpen && alarm.state === '已闭环') return false
+    if (alarmStore.onlyOpen && isTerminalAlarm(alarm.state)) return false
     const text = keyword.trim().toLowerCase()
     if (text.length === 0) return true
     const point = pointStore.points.find((item) => item.id === alarm.pointId)
@@ -151,6 +154,14 @@ export default function AlarmBoard() {
     setCloseTarget(null)
   }
 
+  /** 人工重判：确认预警仍成立（清除订正标记）或确认撤销 */
+  const submitRejudge = async (outcome: 'keep' | 'revoke'): Promise<void> => {
+    if (!rejudgeTarget) return
+    await alarmStore.rejudgeAlarm(rejudgeTarget.id, outcome)
+    message.success(outcome === 'revoke' ? '经人工重判，预警已撤销' : '已确认预警仍然成立，回到正常处置流程')
+    setRejudgeTarget(null)
+  }
+
   const pointOptions = pointStore.points.map((point) => {
     const dam = damStore.dams.find((item) => item.id === point.damId)
     return { label: `${point.code} · ${point.type} · ${dam ? dam.name : '未知坝体'}`, value: point.id }
@@ -180,6 +191,7 @@ export default function AlarmBoard() {
       title: '触发读数',
       width: 130,
       render: (_value, record) => {
+        // 观测行读数为订正后的当前值（同测点同日以最后一次订正为准）
         const observation = observationTable.rows.find(
           (row) => row.pointId === record.pointId && row.date === record.triggerDate
         )
@@ -188,23 +200,55 @@ export default function AlarmBoard() {
     },
     {
       title: '状态',
-      width: 110,
-      render: (_value, record) => (
-        <Tag color={record.state === '已闭环' ? 'green' : record.state === '处置中' ? 'blue' : 'orange'}>
-          {record.state}
-        </Tag>
-      )
+      width: 130,
+      render: (_value, record) => {
+        const color =
+          record.state === '已闭环'
+            ? 'green'
+            : record.state === '已撤销'
+              ? 'default'
+              : record.state === '处置中'
+                ? 'blue'
+                : 'orange'
+        return (
+          <Space size={4} wrap>
+            <Tag color={color} style={{ marginInlineEnd: 0 }}>
+              {record.state}
+            </Tag>
+            {record.readingCorrected ? (
+              <Tooltip title="该预警依据的读数已被订正，级别与触发值已按新值更新，请人工重新研判">
+                <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                  读数已订正
+                </Tag>
+              </Tooltip>
+            ) : null}
+          </Space>
+        )
+      }
     },
     { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
     { title: '处置措施', dataIndex: 'measure', width: 220, render: (value: string) => value || '—' },
     {
       title: '操作',
-      width: 220,
+      width: 260,
       render: (_value, record) => (
-        <Space size={4}>
-          <Button type="link" size="small" disabled={!ALARM_STATE_FLOW[record.state]} onClick={() => advance(record)}>
-            {ALARM_STATE_FLOW[record.state] === '处置中' ? '开始处置' : ALARM_STATE_FLOW[record.state] === '已闭环' ? '闭环' : '已闭环'}
-          </Button>
+        <Space size={4} wrap>
+          {isOpenAlarm(record.state) ? (
+            <>
+              <Button type="link" size="small" onClick={() => advance(record)}>
+                {record.state === '待处置' ? '开始处置' : '闭环'}
+              </Button>
+              {record.readingCorrected ? (
+                <Button type="link" size="small" style={{ color: '#c9963c' }} onClick={() => setRejudgeTarget(record)}>
+                  人工重判
+                </Button>
+              ) : null}
+            </>
+          ) : (
+            <Tag className="muted" style={{ border: 'none', background: 'transparent' }}>
+              {ALARM_STATE_FLOW[record.state] === null && record.state === '已撤销' ? '已撤销' : '已闭环'}
+            </Tag>
+          )}
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
@@ -224,7 +268,7 @@ export default function AlarmBoard() {
         <div>
           <h2 className="page-head__title">预警触发与处置闭环</h2>
           <p className="page-head__desc">
-            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档。
+            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档；读数订正后，待处置预警不再越限会自动撤销，处置中预警待人工重判。
           </p>
         </div>
         <div className="page-head__actions">
@@ -245,7 +289,21 @@ export default function AlarmBoard() {
         <StatBadge label="预警总数" value={alarmStore.alarms.length} suffix="张" tone="primary" />
         <StatBadge label="待处置" value={counts['待处置']} suffix="张" tone="warning" />
         <StatBadge label="处置中" value={counts['处置中']} suffix="张" tone="info" />
-        <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="danger" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`} />
+        <StatBadge label="已闭环" value={counts['已闭环']} suffix="张" tone="success" />
+        <StatBadge
+          label="已撤销"
+          value={counts['已撤销']}
+          suffix="张"
+          tone="default"
+          hint="读数订正后不再越限的待处置预警，自动转为已撤销"
+        />
+        <StatBadge
+          label="办结率"
+          value={alarmStore.closedPercent()}
+          percent={alarmStore.closedPercent()}
+          tone="danger"
+          hint={`已闭环 + 已撤销占比；级别 红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`}
+        />
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索测点编号 / 处置人 / 措施" onModelChange={onModelChange} />
@@ -323,6 +381,46 @@ export default function AlarmBoard() {
             <Input.TextArea rows={3} placeholder="填写处置经过与复测结论" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={rejudgeTarget !== null}
+        title="读数订正 · 人工重判"
+        onCancel={() => setRejudgeTarget(null)}
+        footer={
+          <Space>
+            <Button onClick={() => setRejudgeTarget(null)}>再看看</Button>
+            <Popconfirm
+              title="确认撤销该预警？撤销后为终态，不再随订正联动。"
+              onConfirm={() => submitRejudge('revoke')}
+            >
+              <Button danger>确认撤销</Button>
+            </Popconfirm>
+            <Button type="primary" onClick={() => submitRejudge('keep')}>
+              预警仍成立
+            </Button>
+          </Space>
+        }
+        destroyOnClose
+      >
+        {rejudgeTarget ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <p className="muted" style={{ margin: 0 }}>
+              该预警依据的读数已被订正，系统已按新值更新级别与触发值。请结合现场复测情况人工重新研判：
+            </p>
+            <Space wrap>
+              <AlarmTag level={rejudgeTarget.level} size="small" />
+              <Tag color="blue">{rejudgeTarget.state}</Tag>
+              <span>
+                触发值 {rejudgeTarget.triggerValue.toFixed(3)} · 触发日期 {rejudgeTarget.triggerDate}
+              </span>
+            </Space>
+            <p className="muted" style={{ margin: 0 }}>
+              · 「预警仍成立」：清除订正标记，回到正常处置流程；
+              <br />· 「确认撤销」：预警转为已撤销（终态）。
+            </p>
+          </div>
+        ) : null}
       </Modal>
     </div>
   )

@@ -10,10 +10,11 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
-import { cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
+import type { Correction } from '@/types/correction'
+import { cumulativeOf, dailyRateOf, daysBetween, recomputeSeries } from '@/utils/threshold'
 
 export const DB_NAME = 'gbtaildam'
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 export const LS_KEYS = {
   dbVersion: 'gbtaildam:db-version',
@@ -38,13 +39,14 @@ export interface BackupPayload {
   observations: Observation[]
   alarms: Alarm[]
   pools: Pool[]
+  corrections?: Correction[]
 }
 
 export interface Revisioned {
   revision?: number
 }
 
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 export type DamRow = Dam & Revisioned
 export type SectionRow = Section & Revisioned
@@ -52,6 +54,7 @@ export type PointRow = Point & Revisioned
 export type ObservationRow = Observation & Revisioned
 export type AlarmRow = Alarm & Revisioned
 export type PoolRow = Pool & Revisioned
+export type CorrectionRow = Correction & Revisioned
 
 class TailDamDatabase extends Dexie {
   dams!: Table<DamRow, string>
@@ -60,6 +63,7 @@ class TailDamDatabase extends Dexie {
   observations!: Table<ObservationRow, string>
   alarms!: Table<AlarmRow, string>
   pools!: Table<PoolRow, string>
+  corrections!: Table<CorrectionRow, string>
 
   constructor() {
     super(DB_NAME)
@@ -74,7 +78,7 @@ class TailDamDatabase extends Dexie {
     })
 
     // v2：测点/预警补 damId 冗余列（按坝体筛选免联表）；全部表补 revision 行修订号
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         dams: 'id, name, damType, grade, updatedAt',
         sections: 'id, damId, stakeNo, updatedAt',
@@ -121,6 +125,28 @@ class TailDamDatabase extends Dexie {
             }
             if (typeof alarm.handler !== 'string') alarm.handler = ''
             if (typeof alarm.measure !== 'string') alarm.measure = ''
+          })
+      })
+
+    // v3：新增读数订正记录表；预警增加订正标记字段（readingCorrected 无需建索引，仅按既有 state 过滤）
+    this.version(DB_VERSION)
+      .stores({
+        dams: 'id, name, damType, grade, updatedAt',
+        sections: 'id, damId, stakeNo, updatedAt',
+        points: 'id, sectionId, damId, code, type, updatedAt',
+        observations: 'id, pointId, date, observer, updatedAt',
+        alarms: 'id, pointId, damId, level, state, updatedAt',
+        pools: 'id, damId, date, updatedAt',
+        corrections: 'id, observationId, pointId, damId, date, corrector, correctedAt'
+      })
+      .upgrade(async (tx) => {
+        // 历史预警补齐读数订正标记：历史数据均未受订正影响，默认无标记
+        await tx
+          .table('alarms')
+          .toCollection()
+          .modify((alarm: Record<string, unknown>) => {
+            if (typeof alarm.readingCorrected !== 'boolean') alarm.readingCorrected = false
+            if (typeof alarm.lastCorrectionId !== 'string') alarm.lastCorrectionId = ''
           })
       })
   }
@@ -229,14 +255,18 @@ function buildSeedObservations(): ObservationRow[] {
 }
 
 export async function seedDatabase(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await db.dams.bulkPut(SEED_DAMS)
-    await db.sections.bulkPut(SEED_SECTIONS)
-    await db.points.bulkPut(SEED_POINTS)
-    await db.observations.bulkPut(buildSeedObservations())
-    await db.alarms.bulkPut(SEED_ALARMS)
-    await db.pools.bulkPut(SEED_POOLS)
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.corrections],
+    async () => {
+      await db.dams.bulkPut(SEED_DAMS)
+      await db.sections.bulkPut(SEED_SECTIONS)
+      await db.points.bulkPut(SEED_POINTS)
+      await db.observations.bulkPut(buildSeedObservations())
+      await db.alarms.bulkPut(SEED_ALARMS)
+      await db.pools.bulkPut(SEED_POOLS)
+    }
+  )
 }
 
 /** 首屏调用：打开数据库并在主表为空时播种演示数据 */
@@ -250,26 +280,32 @@ export async function initDatabase(): Promise<void> {
 /* ============================== 级联删除 ============================== */
 
 export async function deleteDamCascade(damId: string): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    const sections = await db.sections.where('damId').equals(damId).toArray()
-    await deletePointsOfSections(sections.map((section) => section.id))
-    if (sections.length > 0) await db.sections.bulkDelete(sections.map((section) => section.id))
-    await db.pools.where('damId').equals(damId).delete()
-    await db.dams.delete(damId)
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.corrections],
+    async () => {
+      const sections = await db.sections.where('damId').equals(damId).toArray()
+      await deletePointsOfSections(sections.map((section) => section.id))
+      if (sections.length > 0) await db.sections.bulkDelete(sections.map((section) => section.id))
+      await db.pools.where('damId').equals(damId).delete()
+      await db.corrections.where('damId').equals(damId).delete()
+      await db.dams.delete(damId)
+    }
+  )
 }
 
 export async function deleteSectionCascade(sectionId: string): Promise<void> {
-  await db.transaction('rw', db.sections, db.points, db.observations, db.alarms, async () => {
+  await db.transaction('rw', db.sections, db.points, db.observations, db.alarms, db.corrections, async () => {
     await deletePointsOfSections([sectionId])
     await db.sections.delete(sectionId)
   })
 }
 
 export async function deletePointCascade(pointId: string): Promise<void> {
-  await db.transaction('rw', db.points, db.observations, db.alarms, async () => {
+  await db.transaction('rw', db.points, db.observations, db.alarms, db.corrections, async () => {
     await db.observations.where('pointId').equals(pointId).delete()
     await db.alarms.where('pointId').equals(pointId).delete()
+    await db.corrections.where('pointId').equals(pointId).delete()
     await db.points.delete(pointId)
   })
 }
@@ -281,6 +317,7 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
   if (pointIds.length > 0) {
     await db.observations.where('pointId').anyOf(pointIds).delete()
     await db.alarms.where('pointId').anyOf(pointIds).delete()
+    await db.corrections.where('pointId').anyOf(pointIds).delete()
     await db.points.bulkDelete(pointIds)
   }
 }
@@ -288,25 +325,27 @@ async function deletePointsOfSections(sectionIds: string[]): Promise<void> {
 /* ============================ 整库导入导出 ============================ */
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, corrections] = await Promise.all([
     db.dams.count(),
     db.sections.count(),
     db.points.count(),
     db.observations.count(),
     db.alarms.count(),
-    db.pools.count()
+    db.pools.count(),
+    db.corrections.count()
   ])
-  return { dams, sections, points, observations, alarms, pools }
+  return { dams, sections, points, observations, alarms, pools, corrections }
 }
 
 export async function exportSnapshot(): Promise<BackupPayload> {
-  const [dams, sections, points, observations, alarms, pools] = await Promise.all([
+  const [dams, sections, points, observations, alarms, pools, corrections] = await Promise.all([
     db.dams.toArray(),
     db.sections.toArray(),
     db.points.toArray(),
     db.observations.toArray(),
     db.alarms.toArray(),
-    db.pools.toArray()
+    db.pools.toArray(),
+    db.corrections.toArray()
   ])
   const strip = <T extends Revisioned>(row: T): Omit<T, 'revision'> => {
     const { revision: _revision, ...rest } = row
@@ -321,41 +360,54 @@ export async function exportSnapshot(): Promise<BackupPayload> {
     points: points.map(strip),
     observations: observations.map(strip),
     alarms: alarms.map(strip),
-    pools: pools.map(strip)
+    pools: pools.map(strip),
+    corrections: corrections.map(strip)
   }
 }
 
 export async function importSnapshot(payload: BackupPayload): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await Promise.all([
-      db.dams.clear(),
-      db.sections.clear(),
-      db.points.clear(),
-      db.observations.clear(),
-      db.alarms.clear(),
-      db.pools.clear()
-    ])
-    const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
-    await db.dams.bulkPut((payload.dams ?? []).map(rev))
-    await db.sections.bulkPut((payload.sections ?? []).map(rev))
-    await db.points.bulkPut((payload.points ?? []).map(rev))
-    await db.observations.bulkPut((payload.observations ?? []).map(rev))
-    await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
-    await db.pools.bulkPut((payload.pools ?? []).map(rev))
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.corrections],
+    async () => {
+      await Promise.all([
+        db.dams.clear(),
+        db.sections.clear(),
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.pools.clear(),
+        db.corrections.clear()
+      ])
+      const rev = <T>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION })
+      await db.dams.bulkPut((payload.dams ?? []).map(rev))
+      await db.sections.bulkPut((payload.sections ?? []).map(rev))
+      await db.points.bulkPut((payload.points ?? []).map(rev))
+      await db.observations.bulkPut((payload.observations ?? []).map(rev))
+      // 旧版备份没有 readingCorrected / 已撤销状态，导入时保持原行内容，缺省字段由读取方按 undefined 处理
+      await db.alarms.bulkPut((payload.alarms ?? []).map(rev))
+      await db.pools.bulkPut((payload.pools ?? []).map(rev))
+      await db.corrections.bulkPut((payload.corrections ?? []).map(rev))
+    }
+  )
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools], async () => {
-    await Promise.all([
-      db.dams.clear(),
-      db.sections.clear(),
-      db.points.clear(),
-      db.observations.clear(),
-      db.alarms.clear(),
-      db.pools.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.dams, db.sections, db.points, db.observations, db.alarms, db.pools, db.corrections],
+    async () => {
+      await Promise.all([
+        db.dams.clear(),
+        db.sections.clear(),
+        db.points.clear(),
+        db.observations.clear(),
+        db.alarms.clear(),
+        db.pools.clear(),
+        db.corrections.clear()
+      ])
+    }
+  )
 }
 
 export async function resetDatabase(): Promise<void> {
@@ -363,45 +415,49 @@ export async function resetDatabase(): Promise<void> {
   await seedDatabase()
 }
 
-/** 观测录入：写入累计变化量与日速率 */
+/**
+ * 观测录入 / 普通编辑：写入读数后重算该测点序列。
+ * 注意：读数录错请走订正链路（applyReadingCorrection），本函数不留订正痕、不联动预警。
+ */
 export async function putObservation(
   row: Omit<Observation, 'cumulative' | 'dailyRate'> & { cumulative?: number; dailyRate?: number }
 ): Promise<ObservationRow> {
-  const point = await db.points.get(row.pointId)
-  const initialValue = point ? point.initialValue : 0
-  const others = (await db.observations.where('pointId').equals(row.pointId).toArray())
-    .filter((item) => item.id !== row.id)
-    .sort((a, b) => a.date.localeCompare(b.date))
-  const previous = others.filter((item) => item.date < row.date).pop() ?? null
-  const cumulative = cumulativeOf(row.reading, initialValue)
-  const dailyRate = previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0
+  const now = Date.now()
+  // 先写入占位派生值，随后 recalculateObservations 会按初值与相邻观测统一重算覆盖
   const next: ObservationRow = {
     ...row,
-    cumulative,
-    dailyRate,
+    cumulative: row.cumulative ?? 0,
+    dailyRate: row.dailyRate ?? 0,
     revision: ROW_REVISION
   }
   await db.observations.put(next)
-  return next
+  // 日期可能提前/改后，整条序列统一重算（未变化的行不会被写入，时间戳保留）
+  await recalculateObservations(row.pointId, now)
+  const saved = await db.observations.get(row.id)
+  return saved ?? next
 }
 
-/** 重算某测点全部观测的累计变化量与日速率 */
-export async function recalculateObservations(pointId: string): Promise<void> {
+/**
+ * 重算某测点全部观测的累计变化量与日速率。
+ * 只回写派生值确实发生变化的行；当 touchAt 给定时用该时间作为变化行的 updatedAt。
+ * @returns 实际被回写的观测 id 集合
+ */
+export async function recalculateObservations(pointId: string, touchAt?: number): Promise<string[]> {
   const point = await db.points.get(pointId)
   const initialValue = point ? point.initialValue : 0
-  const rows = (await db.observations.where('pointId').equals(pointId).toArray()).sort((a, b) =>
-    a.date.localeCompare(b.date)
-  )
-  const patches = rows.map((row, index) => {
-    const previous = index === 0 ? null : rows[index - 1]
-    return {
-      ...row,
-      cumulative: cumulativeOf(row.reading, initialValue),
-      dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
-      updatedAt: Date.now()
+  const rows = await db.observations.where('pointId').equals(pointId).toArray()
+  const recomputed = recomputeSeries(rows, initialValue)
+  const now = touchAt ?? Date.now()
+  const changed: ObservationRow[] = []
+  rows.forEach((row) => {
+    const target = recomputed.get(row.id)
+    if (!target) return
+    if (row.cumulative !== target.cumulative || row.dailyRate !== target.dailyRate) {
+      changed.push({ ...row, cumulative: target.cumulative, dailyRate: target.dailyRate, updatedAt: now })
     }
   })
-  if (patches.length > 0) await db.observations.bulkPut(patches)
+  if (changed.length > 0) await db.observations.bulkPut(changed)
+  return changed.map((row) => row.id)
 }
 
 /* ============================ 本地 UI 偏好 ============================ */

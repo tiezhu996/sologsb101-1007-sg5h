@@ -12,6 +12,7 @@ const PointConfig = lazy(() => import('../pages/PointConfig'))
 const ObservationEntry = lazy(() => import('../pages/ObservationEntry'))
 const TrendBoard = lazy(() => import('../pages/TrendBoard'))
 const AlarmBoard = lazy(() => import('../pages/AlarmBoard'))
+const CorrectionList = lazy(() => import('../pages/CorrectionList'))
 const PoolLog = lazy(() => import('../pages/PoolLog'))
 
 export const ROUTES = {
@@ -20,6 +21,7 @@ export const ROUTES = {
   observations: '/observations',
   trends: '/trends',
   alarms: '/alarms',
+  corrections: '/corrections',
   pool: '/pool'
 } as const
 
@@ -42,6 +44,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'observations', element: withSuspense(<ObservationEntry />) },
       { path: 'trends', element: withSuspense(<TrendBoard />) },
       { path: 'alarms', element: withSuspense(<AlarmBoard />) },
+      { path: 'corrections', element: withSuspense(<CorrectionList />) },
       { path: 'pool', element: withSuspense(<PoolLog />) },
       { path: '*', element: <Navigate to={ROUTES.dams} replace /> }
     ]
